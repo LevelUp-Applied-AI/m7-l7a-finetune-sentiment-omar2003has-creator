@@ -126,7 +126,7 @@ def train_classifier(
         args=training_args,
         train_dataset=tokenized_ds["train"],
         eval_dataset=tokenized_ds["test"],
-        processing_class=tokenizer,
+        tokenizer=tokenizer,  # Use 'tokenizer' instead of 'processing_class'
         data_collator=data_collator,
         compute_metrics=compute_metrics
     )
@@ -134,7 +134,6 @@ def train_classifier(
     trainer.train()
 
     return trainer
-
 
 def evaluate_classifier(trainer: Trainer, tokenized_test) -> dict:
     """
