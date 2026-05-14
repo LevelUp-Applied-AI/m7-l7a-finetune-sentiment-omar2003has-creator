@@ -19,7 +19,7 @@ import os
 import numpy as np
 import pandas as pd
 from datasets import Dataset, DatasetDict
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -27,6 +27,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from transformers import AutoModelForSequenceClassification
 
 
 # 3-class sentiment label mapping (matches the curated dataset's `label` column)
@@ -34,7 +35,7 @@ ID2LABEL = {0: "negative", 1: "neutral", 2: "positive"}
 LABEL2ID = {v: k for k, v in ID2LABEL.items()}
 
 
-def     get_data_path() -> str:
+def get_data_path() -> str:
     """
     Return DATA_PATH env var if set (CI uses a smoke CSV); otherwise return
     the default path to the curated app-review training CSV.
@@ -47,10 +48,10 @@ def     get_data_path() -> str:
 def prepare_dataset(data_path: str, test_size: float = 0.2, seed: int = 42) -> DatasetDict:
     """Load the CSV at `data_path` into a HuggingFace DatasetDict with "train" and "test" splits."""
    
-    df=pd.read_csv(data_path)
+    df = pd.read_csv(data_path)
     raw_ds = Dataset.from_pandas(df, preserve_index=False)
-    spilt_ds = raw_ds.train_test_split(test_size=test_size, seed=seed)
-    return spilt_ds
+    split_ds = raw_ds.train_test_split(test_size=test_size, seed=seed)
+    return split_ds
     
 
 
@@ -63,6 +64,7 @@ def tokenize_dataset(ds_dict: DatasetDict, tokenizer, max_length: int = 128) -> 
     
     ds_dict_tokenized = ds_dict.map(tokenize_fn, batched=True)
     return ds_dict_tokenized
+
 
 def make_training_args(
     output_dir: str,
@@ -82,15 +84,15 @@ def make_training_args(
         save_strategy="epoch",
         logging_steps=50,
     )
+
+
 def compute_metrics(eval_pred):
     """
     Convert (logits, labels) into {"accuracy": ..., "macro_f1": ...}.
     """
     logits, labels = eval_pred
-    # Argmax logits over axis 1 to get predicted class indices
     predictions = np.argmax(logits, axis=1)
     
-    # Compute accuracy and macro-F1 using sklearn
     acc = accuracy_score(labels, predictions)
     f1 = f1_score(labels, predictions, average="macro")
     
@@ -110,7 +112,6 @@ def train_classifier(
     """
     Construct and train a Trainer.
     """
-    # Load model with specific number of labels and label mappings for metadata
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name, 
         num_labels=num_labels, 
@@ -118,10 +119,8 @@ def train_classifier(
         label2id=LABEL2ID
     )
 
-    # Build DataCollator for dynamic padding at training time
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # Construct Trainer with required components
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -132,7 +131,6 @@ def train_classifier(
         compute_metrics=compute_metrics
     )
 
-    # Start the fine-tuning process
     trainer.train()
 
     return trainer
@@ -142,29 +140,31 @@ def evaluate_classifier(trainer: Trainer, tokenized_test) -> dict:
     """
     Evaluate the trainer's model on the test split.
     """
-    # Get predictions on tokenized_test
     predictions_output = trainer.predict(tokenized_test)
     logits = predictions_output.predictions
     labels = predictions_output.label_ids
     
-    # Get predicted indices
     pred_idx = np.argmax(logits, axis=1)
     
-    # Compute overall metrics
     acc = accuracy_score(labels, pred_idx)
     macro_f1 = f1_score(labels, pred_idx, average="macro")
     
-    # Compute per-class F1 (average=None returns an array of scores)
+    # Per-class metrics (using sklearn)
     f1_per_class = f1_score(labels, pred_idx, average=None)
+    precision_per_class = precision_score(labels, pred_idx, average=None, zero_division=0)
+    recall_per_class = recall_score(labels, pred_idx, average=None, zero_division=0)
     
-    # Use id2label from the model config to build the per_class_f1 dict
     id2label = trainer.model.config.id2label
     per_class_f1_dict = {id2label[i]: float(f1_per_class[i]) for i in range(len(f1_per_class))}
+    per_class_precision_dict = {id2label[i]: float(precision_per_class[i]) for i in range(len(precision_per_class))}
+    per_class_recall_dict = {id2label[i]: float(recall_per_class[i]) for i in range(len(recall_per_class))}
     
     return {
         "accuracy": float(acc),
         "macro_f1": float(macro_f1),
-        "per_class_f1": per_class_f1_dict
+        "per_class_f1": per_class_f1_dict,
+        "per_class_precision": per_class_precision_dict,
+        "per_class_recall": per_class_recall_dict
     }
 
 
@@ -179,7 +179,6 @@ def main() -> None:
     tokenized = tokenize_dataset(ds, tokenizer)     
     tokenized.set_format("torch", columns=["input_ids", "attention_mask", "label"])
 
-
     training_args = make_training_args(output_dir)
     trainer = train_classifier(tokenized, model_name, training_args, tokenizer, num_labels=3)
 
@@ -187,22 +186,33 @@ def main() -> None:
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
+    # Save training log (required for test_train_classifier_smoke_loss_decreased)
+    with open("training_log.json", "w") as f:
+        json.dump(trainer.state.log_history, f, indent=2)
+
     # Evaluate
     metrics = evaluate_classifier(trainer, tokenized["test"])
     with open("metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Predictions CSV
+    # Predictions CSV with per-class probabilities
     pred_logits = trainer.predict(tokenized["test"]).predictions
     pred_idx = np.argmax(pred_logits, axis=1)
     pred_probs = _softmax(pred_logits)
     id2label = trainer.model.config.id2label
+    
+    # Create DataFrame with all required columns
     df_out = pd.DataFrame({
         "text": ds["test"]["text"],
         "label": [id2label[i] for i in ds["test"]["label"]],
         "predicted_label": [id2label[i] for i in pred_idx],
         "predicted_probability": [float(pred_probs[i, pred_idx[i]]) for i in range(len(pred_idx))],
     })
+    
+    # Add per-class probability columns (prob_negative, prob_neutral, prob_positive)
+    for i, label_name in id2label.items():
+        df_out[f"prob_{label_name}"] = pred_probs[:, i]
+    
     df_out.to_csv("predictions.csv", index=False)
 
     print(f"Accuracy: {metrics['accuracy']:.4f}")
@@ -215,7 +225,11 @@ def main() -> None:
         [id2label[i] for i in pred_idx],
         labels=list(id2label.values()),
     )
-    print(pd.DataFrame(cm, index=list(id2label.values()), columns=list(id2label.values())).to_string())
+    cm_df = pd.DataFrame(cm, index=list(id2label.values()), columns=list(id2label.values()))
+    print(cm_df.to_string())
+    
+    # Save confusion matrix CSV (required for test_confusion_matrix_csv_persisted)
+    cm_df.to_csv("confusion_matrix.csv")
 
     # Push to Hugging Face Hub.
     # Skipped in CI (DATA_PATH set); requires `huggingface-cli login` locally.
