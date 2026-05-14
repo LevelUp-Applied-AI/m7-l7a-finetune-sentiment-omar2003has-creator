@@ -27,7 +27,6 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-from transformers import AutoModelForSequenceClassification
 
 
 # 3-class sentiment label mapping (matches the curated dataset's `label` column)
@@ -121,12 +120,12 @@ def train_classifier(
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
+    # IMPORTANT: Do NOT pass tokenizer or processing_class here for compatibility
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_ds["train"],
         eval_dataset=tokenized_ds["test"],
-        tokenizer=tokenizer,  # Use 'tokenizer' instead of 'processing_class'
         data_collator=data_collator,
         compute_metrics=compute_metrics
     )
@@ -134,6 +133,7 @@ def train_classifier(
     trainer.train()
 
     return trainer
+
 
 def evaluate_classifier(trainer: Trainer, tokenized_test) -> dict:
     """
